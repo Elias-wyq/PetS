@@ -2,6 +2,7 @@
 #include "turbo_transformers/layers/kernels/sparse_mat_mul.h"
 #include "turbo_transformers/core/cuda_device_context.h"
 #include "turbo_transformers/layers/kernels/utils.h"
+#include "turbo_transformers/layers/kernels/fused_adapter_kernel.h"
 
 namespace turbo_transformers {
 namespace layers {
@@ -261,66 +262,54 @@ void compute_adapter_shadow(
   const core::Tensor &up_scale_w = pet_layer_manager.get_adapter_params(task_id, false, true);
   const core::Tensor &up_scale_b = pet_layer_manager.get_adapter_params(task_id, false, false);
     
-  core::Tensor intermeidate_buffer(nullptr); // declare the shadow output for current task
+  // 使用融合的Adapter内核
   if (core::CUDADeviceContext::num_streams > 1) {
-    intermeidate_buffer.Reshape<float>({task_input->shape(0), task_input->shape(1), down_scale_b.shape(0)},
-                                       task_input->device_type(), task_input->device_id(),
-                                       cuda_ctx.get(),
-                                       "Adapter/Reshape");
+    // 获取输入和输出的指针和维度
+    const float* input_ptr = task_output->data<float>();
+    float* output_ptr = task_output->mutableData<float>();
+    
+    int batch_size = task_output->shape(0);
+    int seq_len = task_output->shape(1);
+    int hidden_size = task_output->shape(2);
+    int intermediate_size = down_scale_b.shape(0);
+    
+    // 调用融合的Adapter内核
+    kernels::LaunchFusedAdapterKernel(
+        input_ptr,
+        down_scale_w.data<float>(),
+        down_scale_b.data<float>(),
+        up_scale_w.data<float>(),
+        output_ptr,
+        batch_size,
+        seq_len,
+        hidden_size,
+        intermediate_size,
+        cuda_ctx.get()->stream());
   } else {
-    intermeidate_buffer.Reshape<float>({task_input->shape(0), task_input->shape(1), down_scale_b.shape(0)},
-                                       task_input->device_type(), task_input->device_id(),
-                                       "Adapter/Reshape");
+    // 单流版本也使用融合内核
+    const float* input_ptr = task_output->data<float>();
+    float* output_ptr = task_output->mutableData<float>();
+    
+    int batch_size = task_output->shape(0);
+    int seq_len = task_output->shape(1);
+    int hidden_size = task_output->shape(2);
+    int intermediate_size = down_scale_b.shape(0);
+    
+    // 调用融合的Adapter内核
+    kernels::LaunchFusedAdapterKernel(
+        input_ptr,
+        down_scale_w.data<float>(),
+        down_scale_b.data<float>(),
+        up_scale_w.data<float>(),
+        output_ptr,
+        batch_size,
+        seq_len,
+        hidden_size,
+        intermediate_size,
+        cudaStreamDefault);
   }
   
-  //input + shared bias  # assume this bias has been merged into the next linear layer
-  // const core::Tensor &task_bias = pet_layer_manager.get_bias(-1);
-  // kernels::AddBias(
-  //         task_bias, task_output, name + "Adapter/AddBias");
-
-  //Different from the DIFF and MASK. Adapter computes based on the dense outputs. 
-  //Downscale
-  if (core::CUDADeviceContext::num_streams > 1) {
-    layers::kernels::MatMul(*task_output, false, down_scale_w, false, 1.0,
-                            &intermeidate_buffer, 0.0,
-                            cuda_ctx.get(),
-                            name + "/Adapter_downscale/MatMul");
-  } else {
-    layers::kernels::MatMul(*task_output, false, down_scale_w, false, 1.0,
-                            &intermeidate_buffer, 0.0,
-                            name + "/Adapter_downscale/MatMul");
-  }
-  
-  //Activation and bias
-  if (core::CUDADeviceContext::num_streams > 1) {
-    layers::kernels::AddBiasAct<float, layers::kernels::ActivationType::Gelu>(
-        down_scale_b, &intermeidate_buffer, cuda_ctx.get(),
-        name + "Adapter_downscale/AddBiasAct");
-  } else {
-    layers::kernels::AddBiasAct<float, layers::kernels::ActivationType::Gelu>(
-        down_scale_b, &intermeidate_buffer,
-        name + "Adapter_downscale/AddBiasAct");
-  }
-  //upscale
-  if (core::CUDADeviceContext::num_streams > 1) {
-    layers::kernels::MatMul(intermeidate_buffer, false, up_scale_w, false, 1.0,
-                            task_shadow_output, 0.0, cuda_ctx.get(),
-                            name + "/Adapter_upscale/MatMul");
-  } else {
-    layers::kernels::MatMul(intermeidate_buffer, false, up_scale_w, false, 1.0,
-                            task_shadow_output, 0.0,
-                            name + "/Adapter_upscale/MatMul");
-  }
-  //residual connection
-  if (core::CUDADeviceContext::num_streams > 1) {
-    layers::kernels::ElwsAdd(*task_shadow_output, *task_output, task_output,
-                             cuda_ctx.get(),
-                             name + "/Adapter_upscale/ElwsAdd");
-  } else {
-    layers::kernels::ElwsAdd(*task_shadow_output, *task_output, task_output,
-                             name + "/Adapter_upscale/ElwsAdd");
-  }
-  
+  // 处理LayerNorm (如果需要)
   if(add_input_bias_layernorm){
     const core::Tensor &task_layer_norm_bias = pet_layer_manager.get_layer_norm_bias(task_id);
     const core::Tensor &task_layer_norm_weight = pet_layer_manager.get_layer_norm_weight(task_id);
@@ -336,7 +325,6 @@ void compute_adapter_shadow(
   }
   else if(add_bias_act){
     std::cerr << "Invalid operation" << std::endl;
-
   }
   else if(split_add_transpose){
     std::cerr << "Invalid operation" << std::endl;
@@ -414,7 +402,8 @@ shadow_op get_shadow_op(
         return compute_nothing;
     default:
         std::cerr<<"Unsupported Shadow Operation!"<<std::endl;
-        break;
+        // 默认返回compute_nothing作为fallback
+        return compute_nothing;
     }
 }
 
